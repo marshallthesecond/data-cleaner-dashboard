@@ -1,4 +1,17 @@
-get-pip.py
-
+# Python
 __pycache__/
 *.pyc
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Generated exports (don't commit the app's output files)
+/cleaned_data.xlsx
+/cleaned_data.csv
+
+# OS / editor cruft
+.DS_Store
+.vscode/
+.idea/

@@ -1,3 +1,5 @@
+import re
+
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -12,17 +14,52 @@ def init_transform_system():
     if "history" not in st.session_state:
         st.session_state["history"] = []
 
+
+def _json_safe(value):
+    """Recursively convert a value into something json.dumps can handle.
+
+    The transformation log is exported as JSON on the Export tab, so numpy
+    scalars, pandas Index objects, sets, etc. must be turned into plain
+    Python types first. This keeps the export from ever crashing.
+    """
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, pd.Index):
+        return [_json_safe(v) for v in value.tolist()]
+    if isinstance(value, np.ndarray):
+        return [_json_safe(v) for v in value.tolist()]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 def log_step(operation, parameters, columns):
     st.session_state["transform_log"].append({
         "operation": operation,
-        "parameters": parameters,
-        "columns": columns
+        "parameters": _json_safe(parameters),
+        "columns": _json_safe(columns)
     })
 
+
 def save_state():
+    """Snapshot the current data so the last action can be undone.
+
+    Always called immediately before a real mutation, so one history entry
+    corresponds to exactly one transformation log entry. That keeps Undo and
+    the log in step with each other.
+    """
     st.session_state["history"].append(
         st.session_state["data"].copy()
     )
+
 
 def undo_last():
     if st.session_state["history"]:
@@ -30,10 +67,52 @@ def undo_last():
         if st.session_state["transform_log"]:
             st.session_state["transform_log"].pop()
 
+
 def reset_all():
     st.session_state["data"] = st.session_state["original_data"].copy()
     st.session_state["transform_log"] = []
     st.session_state["history"] = []
+
+
+def _formula_is_allowed(expr):
+    """Only allow safe column arithmetic in the formula box.
+
+    DataFrame.eval can otherwise reach Python internals through the `@` prefix
+    and dunder attributes. This app only needs arithmetic on column names, so
+    anything that could escape that is rejected outright.
+    """
+    lowered = expr.lower()
+    if "@" in expr or "__" in expr:
+        return False
+    banned = ("import", "lambda", "exec(", "eval(", "open(", "os.",
+              "sys.", "subprocess", "globals", "locals", "getattr", "setattr")
+    return not any(token in lowered for token in banned)
+
+
+def _clean_to_numeric(series):
+    """Convert a messy text column into numbers without mangling values.
+
+    Handles currency symbols, thousands separators and accounting-style
+    negatives like "(123)", while leaving scientific notation and decimals
+    intact. Anything that is not really a number becomes NaN.
+    """
+    # If it is already numeric there is nothing to clean.
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
+
+    s = series.astype(str).str.strip()
+
+    # Accounting negatives: "(123)" -> "-123"
+    negatives = s.str.match(r"^\(.*\)$")
+    s = s.str.replace(r"^\((.*)\)$", r"\1", regex=True)
+
+    # Remove currency symbols, percent signs, spaces and thousands separators,
+    # but keep digits, a single decimal point, sign and the exponent marker.
+    s = s.str.replace(r"[,$€£%\s]", "", regex=True)
+
+    out = pd.to_numeric(s, errors="coerce")
+    out = out.mask(negatives.fillna(False), -out.abs())
+    return out
 
 
 @st.cache_data
@@ -41,17 +120,19 @@ def compute_missing(df):
     df_missing = df.loc[:, df.isnull().any()]
     if df_missing.shape[1] == 0:
         return None
-    
+
     return pd.DataFrame({
         "Column": df_missing.columns,
-        "Missing Count": df_missing.isnull().sum(),
-        "Missing Percentage (%)": (df_missing.isnull().sum() / len(st.session_state["data"]) * 100).round(2),
-        "Data type": st.session_state["data"].dtypes[df_missing.columns].astype(str)
+        "Missing Count": df_missing.isnull().sum().values,
+        "Missing Percentage (%)": (df_missing.isnull().sum().values / len(df) * 100).round(2),
+        "Data type": df.dtypes[df_missing.columns].astype(str).values
     })
+
 
 @st.cache_data
 def compute_missin_percent(df):
     return df.isnull().mean() * 100
+
 
 @st.cache_data
 def compute_duplicates(df, cols, mode):
@@ -67,6 +148,7 @@ def compute_duplicates(df, cols, mode):
         return df[df.duplicated(subset=subset_cols, keep=False)]
     else:
         return df[df.duplicated(keep=False)]
+
 
 @st.cache_data
 def compute_binning_preview(df, col, method, num_bins, labels):
@@ -84,21 +166,21 @@ def compute_binning_preview(df, col, method, num_bins, labels):
             duplicates="drop"
         )
 
-    preview_series_str = preview_series.astype(str)
+    # Count on the (ordered) categorical series so bins stay in numeric order,
+    # then relabel the index as text for display.
+    distribution = preview_series.value_counts().sort_index()
+    distribution.index = distribution.index.astype(str)
 
-    distribution = preview_series_str.value_counts().sort_index()
-
-    return preview_series, distribution, preview_series_str
-
+    return preview_series, distribution
 
 
 # ------------------------------------------------------------ MAIN LOGIC - CLEANING AND PREP --------------------------------------------------
 
 def clean_prep():
-    st.title("Data Cleaning and Preparation") 
+    st.title("Data Cleaning and Preparation")
 
     st.subheader("Page overview")
-    st.write("Here you can clean up your data.Do not reload your page, othervise you'll loose your progress. ")
+    st.write("Here you can clean up your data. Do not reload your page, otherwise you'll lose your progress.")
     st.write("Page goes in the following order: \n\n")
     st.code("1. Handle Missing Values \n\n"
             "2. Duplicate Detection \n\n"
@@ -108,10 +190,9 @@ def clean_prep():
             "6. Numeric Cleaning \n\n"
             "7. Normalization and Scaling \n\n"
             "8. Data Validation Rules \n\n")
-    st.write("**Dataset Preview** is displayed at the end of the page. All your changes will be reflecte there")
-    
+    st.write("**Dataset Preview** is displayed at the end of the page. All your changes will be reflected there.")
 
-    # Show last action if exists
+    # Show the message from the previous action (set just before st.rerun)
     if "last_action" in st.session_state:
         st.success(st.session_state["last_action"])
         del st.session_state["last_action"]
@@ -125,33 +206,15 @@ def clean_prep():
 
     st.space("medium")
 
-
-
-    #----------------------------- 4.1 MISSING VALUES (NULL HANDLING) -------------------   
+    # ----------------------------- 1 MISSING VALUES (NULL HANDLING) -------------------
 
     with st.container(border=True):
-        
+
         st.subheader("1 Handle Missing Values", text_alignment="center")
 
-        if "data" in st.session_state:
-            df_before = st.session_state["data"].copy()
-
-        # Show missing values
-        # df_missing = st.session_state["data"].loc[:, st.session_state["data"].isnull().any()]
-        missing = compute_missing(st.session_state["data"])
-        @st.fragment
-        def show_missing_values():
-            if st.checkbox("Show missing values", key="show_missing_checkbox", value=True):
-                if missing is not None:
-                    with st.container(horizontal=True, vertical_alignment="center"):
-                        st.markdown("**Missing Values Overview:**")
-                        if st.button("Refresh", type="tertiary", icon=":material/refresh:"):
-                            st.rerun()
-                    st.dataframe(missing, use_container_width=True, hide_index=True, width="content")
-                else:
-                    st.success("No missing values remaining!")
-                
-        show_missing_values()
+        # Tracks whether a real change happened this run (drives the preview below)
+        action_triggered = False
+        df_before = st.session_state["data"].copy()
 
         # Drop all rows with missing values
         with st.container(horizontal_alignment="right"):
@@ -159,28 +222,26 @@ def clean_prep():
                 save_state()
 
                 new_df = st.session_state["data"].copy()
-                rows_to_drop = new_df.isna().any(axis=1).sum()
+                rows_to_drop = int(new_df.isna().any(axis=1).sum())
                 new_df = new_df.dropna()
 
                 st.session_state["data"] = new_df.reset_index(drop=True)
 
                 log_step(
                     "Drop missing rows",
-                    {"rows_removed": int(rows_to_drop)},
+                    {"rows_removed": rows_to_drop},
                     "ALL"
                 )
 
                 st.success(f"Dropped {rows_to_drop} rows successfully!")
                 action_triggered = True
 
-        # Per-column missing value handling
-        # Column selector
+        # Per-column missing value handling - column selector
         col_select = st.selectbox(
             "Select columns to handle missing values",
             [None] + st.session_state["data"].columns.tolist(),
             key="fill_column_select"
         )
-        action_triggered = False
 
         st.space("xsmall")
 
@@ -189,40 +250,50 @@ def clean_prep():
         with left:
             with st.container(horizontal=True, horizontal_alignment="right", gap=None):
                 with st.container():
-                    if st.button("Drop selected", key="drop_missing_col_btn", type="primary") and col_select:
-                        save_state()
+                    if st.button("Drop selected", key="drop_missing_col_btn", type="primary"):
+                        if not col_select:
+                            st.warning("Please select a column first.")
+                        else:
+                            save_state()
 
-                        new_df = st.session_state["data"].copy()
-                        rows_to_drop = new_df[col_select].isna().sum()
-                        new_df = new_df.dropna(subset=[col_select])
+                            new_df = st.session_state["data"].copy()
+                            rows_to_drop = int(new_df[col_select].isna().sum())
+                            new_df = new_df.dropna(subset=[col_select])
 
-                        st.session_state["data"] = new_df.reset_index(drop=True)
+                            st.session_state["data"] = new_df.reset_index(drop=True)
 
-                        log_step(
-                            "Drop selected rows",
-                            {"rows_removed": rows_to_drop},
-                            [rows_to_drop]
-                        )
-                        st.success(f"Dropped {rows_to_drop} rows with missing values in '{col_select}' successfully!")
-                        action_triggered = True
+                            log_step(
+                                "Drop selected rows",
+                                {"rows_removed": rows_to_drop},
+                                [col_select]
+                            )
+                            st.success(f"Dropped {rows_to_drop} rows with missing values in '{col_select}' successfully!")
+                            action_triggered = True
                 with st.container(width="content"):
                     # Fill selected values with most frequent categorical value
                     if st.button("Fill with Most Frequent Category", key="fill_frequent_cat_btn"):
-                        save_state()
+                        if not col_select:
+                            st.warning("Please select a column first.")
+                        else:
+                            mode_vals = st.session_state["data"][col_select].mode(dropna=True)
+                            if mode_vals.empty:
+                                st.warning(f"'{col_select}' has no non-missing value to use.")
+                            else:
+                                save_state()
 
-                        new_df = st.session_state["data"].copy()
-                        new_df[col_select] = new_df[col_select].fillna(new_df[col_select].mode().iloc[0])
+                                new_df = st.session_state["data"].copy()
+                                new_df[col_select] = new_df[col_select].fillna(mode_vals.iloc[0])
 
-                        st.session_state["data"] = new_df
+                                st.session_state["data"] = new_df
 
-                        log_step(
-                            "Replace selected with most frequent category",
-                            {"method": "most_frequent"},
-                            {col_select}
-                        )
+                                log_step(
+                                    "Replace selected with most frequent category",
+                                    {"method": "most_frequent"},
+                                    [col_select]
+                                )
 
-                        st.success(f"Filled missing values in '{col_select}' with most frequent category")
-                        action_triggered = True
+                                st.success(f"Filled missing values in '{col_select}' with most frequent category")
+                                action_triggered = True
 
         # Drop columns above a threshold
         with right:
@@ -230,7 +301,7 @@ def clean_prep():
                 with st.container(width="content"):
                     with st.popover("Threshold"):
                         threshold = st.slider(
-                            "Drop selected columns with more than % missing values",
+                            "Drop columns with more than % missing values",
                             0, 100, 50,
                             key="missing_threshold_slider"
                         )
@@ -242,16 +313,16 @@ def clean_prep():
 
                         missing_percent = compute_missin_percent(new_df)
 
-                        cols_to_drop = missing_percent[missing_percent > threshold].index
+                        cols_to_drop = list(missing_percent[missing_percent > threshold].index)
 
                         new_df = new_df.drop(columns=cols_to_drop)
 
                         st.session_state["data"] = new_df.reset_index(drop=True)
 
                         log_step(
-                            "Replace at above threshold",
-                            {"method": "threshold"},
-                            [cols_to_drop]
+                            "Drop columns above missing threshold",
+                            {"threshold_percent": threshold},
+                            cols_to_drop
                         )
 
                         st.success(f"Dropped {len(cols_to_drop)} columns with more than {threshold}% missing values")
@@ -260,56 +331,58 @@ def clean_prep():
         st.space("xsmall")
 
         # Mean, Median, Mode
-        st.write("Replace the selected numeric with:")
+        st.write("Replace the selected numeric column with:")
         btn1, btn2, btn3 = st.columns(3)
         if btn1.button("Mean", key="fill_mean_btn", width="stretch"):
-            save_state()
+            if not col_select:
+                st.warning("Please select a column first.")
+            elif not pd.api.types.is_numeric_dtype(st.session_state["data"][col_select]):
+                st.warning(f"'{col_select}' is not numeric, so mean cannot be used.")
+            else:
+                save_state()
 
-            new_df = st.session_state["data"].copy()
-            new_df[col_select] = new_df[col_select].fillna(new_df[col_select].mean())
+                new_df = st.session_state["data"].copy()
+                new_df[col_select] = new_df[col_select].fillna(new_df[col_select].mean())
 
-            st.session_state["data"] = new_df
+                st.session_state["data"] = new_df
 
-            log_step(
-                "Fill with Mean",
-                {"method": "mean"},
-                [col_select]
-            )
-
-            st.success(f"Filled missing values in '{col_select}' with mean")
-            action_triggered = True
+                log_step("Fill with Mean", {"method": "mean"}, [col_select])
+                st.success(f"Filled missing values in '{col_select}' with mean")
+                action_triggered = True
         if btn2.button("Median", key="fill_median_btn", width="stretch"):
-            save_state()
-            
-            new_df = st.session_state["data"].copy()
-            new_df[col_select] = new_df[col_select].fillna(new_df[col_select].median())
+            if not col_select:
+                st.warning("Please select a column first.")
+            elif not pd.api.types.is_numeric_dtype(st.session_state["data"][col_select]):
+                st.warning(f"'{col_select}' is not numeric, so median cannot be used.")
+            else:
+                save_state()
 
-            st.session_state["data"] = new_df
+                new_df = st.session_state["data"].copy()
+                new_df[col_select] = new_df[col_select].fillna(new_df[col_select].median())
 
-            log_step(
-                "Fill with Median",
-                {"method": "median"},
-                [col_select]
-            )
+                st.session_state["data"] = new_df
 
-            st.success(f"Filled missing values in '{col_select}' with median")
-            action_triggered = True
+                log_step("Fill with Median", {"method": "median"}, [col_select])
+                st.success(f"Filled missing values in '{col_select}' with median")
+                action_triggered = True
         if btn3.button("Mode", key="fill_mode_btn", width="stretch"):
-            save_state()
+            if not col_select:
+                st.warning("Please select a column first.")
+            else:
+                mode_vals = st.session_state["data"][col_select].mode(dropna=True)
+                if mode_vals.empty:
+                    st.warning(f"'{col_select}' has no non-missing value to use.")
+                else:
+                    save_state()
 
-            new_df = st.session_state["data"].copy()
-            new_df[col_select] = new_df[col_select].fillna(new_df[col_select].mode().iloc[0])
+                    new_df = st.session_state["data"].copy()
+                    new_df[col_select] = new_df[col_select].fillna(mode_vals.iloc[0])
 
-            st.session_state["data"] = new_df
+                    st.session_state["data"] = new_df
 
-            log_step(
-                "Fill with Mode",
-                {"method": "mode"},
-                [col_select]
-            )
-
-            st.success(f"Filled missing values in '{col_select}' with mode")
-            action_triggered = True
+                    log_step("Fill with Mode", {"method": "mode"}, [col_select])
+                    st.success(f"Filled missing values in '{col_select}' with mode")
+                    action_triggered = True
 
         st.space("xsmall")
 
@@ -318,25 +391,28 @@ def clean_prep():
             with st.container():
                 constant = st.text_input("Fill selected missing values with:", value="0", key="fill_constant_input")
                 if st.button("Apply Custom Fill", key="apply_custom_fill_btn", type="primary"):
-                    save_state()
+                    if not col_select:
+                        st.warning("Please select a column first.")
+                    else:
+                        save_state()
 
-                    new_df = st.session_state["data"].copy()
-                    try:
-                        value = float(constant)
-                    except:
-                        value = constant
-                    new_df[col_select] = new_df[col_select].fillna(value)
+                        new_df = st.session_state["data"].copy()
+                        try:
+                            value = float(constant)
+                        except (TypeError, ValueError):
+                            value = constant
+                        new_df[col_select] = new_df[col_select].fillna(value)
 
-                    st.session_state["data"] = new_df
+                        st.session_state["data"] = new_df
 
-                    log_step(
-                        "Custom replacement for missing",
-                        {"sample_input": constant},
-                        [col_select]
-                    )
+                        log_step(
+                            "Custom replacement for missing",
+                            {"sample_input": constant},
+                            [col_select]
+                        )
 
-                    st.success(f"Filled missing values in '{col_select}' with '{value}'")
-                    action_triggered = True
+                        st.success(f"Filled missing values in '{col_select}' with '{value}'")
+                        action_triggered = True
 
             st.space("medium")
 
@@ -348,60 +424,70 @@ def clean_prep():
                     horizontal=True
                 )
                 if st.button("Apply Forward / Backward fill", type="primary"):
-                    save_state()
+                    if not col_select:
+                        st.warning("Please select a column first.")
+                    else:
+                        save_state()
 
-                    new_df = st.session_state["data"].copy()
-                    if forward_backward == "Forward fill":
-                        new_df[col_select] = new_df[col_select].ffill()
-                    elif forward_backward == "Backward fill":
-                        new_df[col_select] = new_df[col_select].bfill()
+                        new_df = st.session_state["data"].copy()
+                        if forward_backward == "Forward fill":
+                            new_df[col_select] = new_df[col_select].ffill()
+                        elif forward_backward == "Backward fill":
+                            new_df[col_select] = new_df[col_select].bfill()
 
-                    st.session_state["data"] = new_df
+                        st.session_state["data"] = new_df
 
-                    log_step(
-                        "Fill missing - Forward/Backward",
-                        {"setting": forward_backward},
-                        [col_select]
-                    )
+                        log_step(
+                            "Fill missing - Forward/Backward",
+                            {"setting": forward_backward},
+                            [col_select]
+                        )
 
-                    st.success("Forward/Backward setting applied")
-                    action_triggered = True
+                        st.success("Forward/Backward setting applied")
+                        action_triggered = True
 
         # ------ BEFORE/AFTER PREVIEW -----
         if action_triggered:
             st.divider()
             st.subheader("Action Preview")
             df_after = st.session_state["data"]
-            
+
             m1, m2, m3 = st.columns(3)
-            
-            # Row Count Change
+
+            # Row count change
             rows_b, rows_a = len(df_before), len(df_after)
             m1.metric("Total Rows", rows_a, delta=rows_a - rows_b)
-            
-            # Null Count Change (Inverse color: negative delta = green)
-            nulls_b = df_before.isnull().sum().sum()
-            nulls_a = df_after.isnull().sum().sum()
+
+            # Null count change (inverse color: fewer nulls shows green)
+            nulls_b = int(df_before.isnull().sum().sum())
+            nulls_a = int(df_after.isnull().sum().sum())
             m2.metric("Total Nulls", nulls_a, delta=nulls_a - nulls_b, delta_color="inverse")
-            
-            # Columns Remaining
+
+            # Columns remaining
             cols_b, cols_a = len(df_before.columns), len(df_after.columns)
             m3.metric("Columns", cols_a, delta=cols_a - cols_b)
-            
+
             st.toast("Data updated!")
 
-
+        # Missing values overview, computed from the current data so it always
+        # reflects the action that was just applied (no stale table).
+        st.divider()
+        if st.checkbox("Show missing values", key="show_missing_checkbox", value=True):
+            missing = compute_missing(st.session_state["data"])
+            if missing is not None:
+                st.markdown("**Missing Values Overview:**")
+                st.dataframe(missing, hide_index=True, width="content")
+            else:
+                st.success("No missing values remaining!")
 
     st.space("xlarge")
 
-
-
-    # ------------------- 4.2 DUPLICATE DETECTION -------------------
+    # ------------------- 2 DUPLICATE DETECTION -------------------
 
     with st.container(border=True):
         st.subheader("2 Duplicate Detection", text_alignment="center")
 
-        # Include - exclude toggle
+        # Include / exclude toggle
         mode = st.radio(
             "Show duplicates:",
             ["Including selected columns", "Excluding selected columns"],
@@ -416,19 +502,19 @@ def clean_prep():
             key="duplicate_columns"
         )
 
-        # Detect duplicates
+        # Detect duplicates (read-only: no history or log entry)
         if st.button("Detect Duplicates", key="detect_duplicates_btn"):
-            
+
             new_df = st.session_state["data"]
 
             duplicates = compute_duplicates(new_df, cols, mode)
 
             if duplicates.empty:
-                st.warning("No columns selected for duplicate detection. Or no duplicates found")
+                st.warning("No duplicates found for the current selection.")
             else:
                 st.dataframe(duplicates.head())
                 st.info(f"{len(duplicates)} duplicate rows found")
-            
+
         st.divider()
 
         left, right = st.columns([2, 1], vertical_alignment="bottom")
@@ -446,7 +532,7 @@ def clean_prep():
         # Remove duplicates
         if right.button("Remove Duplicates", key="remove_duplicates_btn", type="primary", width="stretch"):
             save_state()
-            
+
             new_df = st.session_state["data"].copy()
 
             if cols:
@@ -459,11 +545,10 @@ def clean_prep():
             else:
                 new_df = new_df.drop_duplicates(keep=keep_option).reset_index(drop=True)
 
-            st.session_state["data"] = new_df.reset_index(drop=True)
-
+            removed = len(st.session_state["data"]) - len(new_df)
+            st.session_state["data"] = new_df
 
             # Logging
-            col_selected_or_not = cols
             if not cols:
                 col_selected_or_not = "Full-row duplicates"
             else:
@@ -471,24 +556,19 @@ def clean_prep():
 
             log_step(
                 "Remove selected duplicates",
-                {"keep:": keep_option,
-                 "show_duplicates": mode},
+                {"keep": keep_option, "mode": mode, "rows_removed": removed},
                 [col_selected_or_not]
             )
 
-            st.success("Duplicates removed")
-
-
+            st.success(f"{removed} duplicate rows removed")
 
     st.space("xlarge")
 
-
-
-    # ------------------- 4.7 COLUMN OPERATIONS -------------------
+    # ------------------- 3 COLUMN OPERATIONS -------------------
 
     with st.container(border=True):
         st.subheader("3 Column Operations", text_alignment="center")
-        
+
         st.space("medium")
 
         with st.container(horizontal=True):
@@ -501,17 +581,20 @@ def clean_prep():
                     key="columns_to_drop"
                 )
                 if st.button("Drop Columns", key="drop_selected_columns", type="primary"):
-                    save_state()
+                    if not columns_to_drop:
+                        st.warning("Please select at least one column to drop.")
+                    else:
+                        save_state()
 
-                    new_df = st.session_state["data"].drop(columns=columns_to_drop)
-                    st.session_state["data"] = new_df
+                        new_df = st.session_state["data"].drop(columns=columns_to_drop)
+                        st.session_state["data"] = new_df
 
-                    log_step(
-                        "Drop columns",
-                        {"method": "st.drop()"},
-                        [columns_to_drop]
-                    )
-                    st.success("Selected columns dropped")
+                        log_step(
+                            "Drop columns",
+                            {"count": len(columns_to_drop)},
+                            list(columns_to_drop)
+                        )
+                        st.success("Selected columns dropped")
 
             st.space("medium")
 
@@ -528,21 +611,25 @@ def clean_prep():
                     "Enter new column name",
                     key="new_column_name"
                 )
-                if st.button("Rename Column", key="rename_column_btn", type="primary") and new_name:
-                    save_state()
+                if st.button("Rename Column", key="rename_column_btn", type="primary"):
+                    clean_new_name = new_name.strip() if new_name else ""
+                    if not clean_new_name:
+                        st.warning("Please enter a new column name.")
+                    elif clean_new_name != old_name and clean_new_name in st.session_state["data"].columns:
+                        st.warning(f"A column named '{clean_new_name}' already exists. Choose a different name.")
+                    else:
+                        save_state()
 
-                    new_df = st.session_state["data"].rename(columns={old_name: new_name})
-                    st.session_state["data"] = new_df
+                        new_df = st.session_state["data"].rename(columns={old_name: clean_new_name})
+                        st.session_state["data"] = new_df
 
-                    log_step(
-                        "Rename columns",
-                        {
-                            "New column name": new_name
-                        },
-                        [old_name]
-                    )
-                    st.success("Column renamed successfully")
-        
+                        log_step(
+                            "Rename columns",
+                            {"New column name": clean_new_name},
+                            [old_name]
+                        )
+                        st.success("Column renamed successfully")
+
         st.divider()
 
         with st.container(horizontal=True):
@@ -553,58 +640,46 @@ def clean_prep():
 
                 with st.popover("Helper! / Rules", type="tertiary"):
                     st.write("Write formulas using your exact column names. \n\n"
-                                "Before applying a new formula, convert the columns into *String* or *Intiger* \n\n"
-                                "*Examples:* `Price / Quantity`, `Age * 1.2`, `Salary - Salary.mean()` \n\n"
-                                "It supports standard arithmetic (+, -, *, /) and boolean operators (&, |, ~) \n\n"
-                                "Use `` ` `` backticks if column names have space")
-                    
+                             "Before applying a new formula, convert the columns into *String* or *Integer*. \n\n"
+                             "*Examples:* `Price / Quantity`, `Age * 1.2`, `Salary - Salary.mean()` \n\n"
+                             "It supports standard arithmetic (+, -, *, /) and boolean operators (&, |, ~). \n\n"
+                             "Use `` ` `` backticks if column names have spaces.")
+
                 with st.container():
                     new_formula_col = st.text_input("New Column Name", key="new_formula_col")
                 with st.container():
                     formula_input = st.text_input("Formula", key="formula_input")
 
                 if st.button("Apply Formula", key="btn_apply_formula", type="primary"):
-                    save_state()
 
                     if new_formula_col and formula_input:
-                        new_df = st.session_state["data"].copy()
-                        success = False
-
-                        try:
-                            # pd.eval evaluates the string expression dynamically
-                            new_df[new_formula_col] = new_df.eval(formula_input, engine="python")
-                            
-                            st.session_state["data"] = new_df
-                            st.success(f"Successfully created '{new_formula_col}'.")
-
-                            success = True
-                            
-                        except Exception as e:
-                            st.error(f"Error evaluating formula. Check your column names and syntax. \n\n"
-                                     "Check *Helper!/Rules* \n\n"
-                                     f"Details: {e}")
-                            success = False
-                        if success:
-                            log_step(
-                                "Custom formula",
-                                {
-                                    "New column": new_formula_col,
-                                    "Formula": formula_input
-                                },
-                                {"No original column was affected"}
-                            )
+                        if not _formula_is_allowed(formula_input):
+                            st.error("This formula uses names or symbols that are not allowed. "
+                                     "Use only your column names, numbers and arithmetic operators.")
                         else:
-                            log_step(
-                                "Error occured at Apply fomula",
-                                {
-                                    "New column": new_formula_col,
-                                    "Formula": formula_input
-                                },
-                                {"No original column was affected"}
-                            )
+                            new_df = st.session_state["data"].copy()
+                            try:
+                                # Evaluate the arithmetic expression over the columns.
+                                result = new_df.eval(formula_input, engine="python")
+
+                                save_state()
+                                new_df[new_formula_col] = result
+                                st.session_state["data"] = new_df
+
+                                log_step(
+                                    "Custom formula",
+                                    {"New column": new_formula_col, "Formula": formula_input},
+                                    []
+                                )
+                                st.success(f"Successfully created '{new_formula_col}'.")
+
+                            except Exception as e:
+                                st.error("Error evaluating formula. Check your column names and syntax. \n\n"
+                                         "See *Helper!/Rules* above. \n\n"
+                                         f"Details: {e}")
                     else:
                         st.warning("Please provide both a new column name and a formula.")
-                    
+
             st.space("medium")
 
             with st.container():
@@ -613,18 +688,15 @@ def clean_prep():
 
                 numeric_columns = st.session_state["data"].select_dtypes(include=["number"]).columns.tolist()
 
-                # Function for previewing bins
-                # def preview_bins():
-                    
                 if numeric_columns:
                     bin_target_col = st.selectbox("Select column to bin", numeric_columns, key="bin_target_col")
                     new_binned_col = st.text_input("New Binned Column Name", key="new_binned_col")
-                    
+
                     bin_col1, bin_col2 = st.columns(2)
                     with bin_col1:
                         bin_method = st.radio(
-                            "Binning Method", 
-                            ["Equal-width (Standard)", "Quantile (Equal-sized groups)"], 
+                            "Binning Method",
+                            ["Equal-width (Standard)", "Quantile (Equal-sized groups)"],
                             key="bin_method"
                         )
                     with bin_col2:
@@ -634,11 +706,15 @@ def clean_prep():
                         with st.container():
                             use_labels = st.checkbox("Use custom labels")
                         with st.container():
-                            suggested_bins = int(np.ceil(np.log2(len(st.session_state["data"])) + 1))
-                            st.caption(f"Suggested bins: {suggested_bins}", help="Suggestion used by Sturges' rule - a simple, " \
-                            "commonly used statistical formula to determine the optimal number of bins for a histogram, " \
-                            "based on the number of observations. It works best for relatively small, normal datasets")
-                        
+                            n_rows = len(st.session_state["data"])
+                            if n_rows > 1:
+                                suggested_bins = max(2, int(np.ceil(np.log2(n_rows) + 1)))
+                            else:
+                                suggested_bins = 2
+                            st.caption(f"Suggested bins: {suggested_bins}", help="Suggestion uses Sturges' rule - a simple, "
+                                       "commonly used statistical formula to determine the optimal number of bins for a histogram, "
+                                       "based on the number of observations. It works best for relatively small, normal datasets.")
+
                     labels = None
                     if use_labels:
                         labels_input = st.text_input("Enter labels (comma-separated)", placeholder="Low, Medium, High, Very High")
@@ -647,61 +723,56 @@ def clean_prep():
 
                     if labels and len(labels) != num_bins:
                         st.error("Number of labels must match number of bins.")
-                        # st.stop()
 
                     btn1, btn2 = st.columns([1, 3])
-                    # with st.container(horizontal=True):
 
                     with btn1:
                         if st.button("Apply Binning", key="btn_apply_binning", type="primary"):
-                            save_state()
-
-                            if new_binned_col:
+                            if not new_binned_col:
+                                st.warning("Please provide a name for the new binned column.")
+                            elif labels and len(labels) != num_bins:
+                                st.error("Number of labels must match number of bins.")
+                            else:
                                 new_df = st.session_state["data"].copy()
                                 try:
                                     if bin_method == "Equal-width (Standard)":
                                         # pd.cut divides the range into equal-width intervals
-                                        new_df[new_binned_col] = pd.cut(
-                                            new_df[bin_target_col], 
-                                            bins=num_bins, 
+                                        binned = pd.cut(
+                                            new_df[bin_target_col],
+                                            bins=num_bins,
                                             labels=labels if labels else None
                                         )
                                     else:
-                                        # pd.qcut divides the data so each bin has roughly the same number of records
-                                        # duplicates="drop" prevents errors if many identical values fall on a bin edge
-                                        new_df[new_binned_col] = pd.qcut(
-                                            new_df[bin_target_col], 
+                                        # pd.qcut divides the data so each bin has roughly the same number of records.
+                                        # duplicates="drop" prevents errors when many identical values fall on a bin edge.
+                                        binned = pd.qcut(
+                                            new_df[bin_target_col],
                                             q=num_bins,
                                             labels=labels if labels else None,
                                             duplicates="drop"
                                         )
-                                    
-                                    if labels and len(labels) != num_bins:
-                                        st.error("Number of labels must match number of bins.")
-                                        st.stop()
-                                    
+
+                                    save_state()
+                                    new_df[new_binned_col] = binned
                                     st.session_state["data"] = new_df
 
                                     log_step(
-                                        "Bining numeric columns",
+                                        "Binning numeric columns",
                                         {
                                             "New column name": new_binned_col,
                                             "Binning method": bin_method,
-                                            "No. of bins": num_bins
+                                            "No. of bins": int(num_bins)
                                         },
                                         [bin_target_col]
                                     )
                                     st.success(f"Successfully created binned column '{new_binned_col}'.")
                                 except Exception as e:
                                     st.error(f"Error during binning: {e}")
-                            else:
-                                st.warning("Please provide a name for the new binned column.")
-                            
+
                     with btn2:
                         with st.popover("Preview bins before applying", width="stretch"):
-                            new_df = st.session_state["data"].copy()
                             try:
-                                preview_series, preview_series_str, distribution = compute_binning_preview(
+                                preview_series, distribution = compute_binning_preview(
                                     st.session_state["data"],
                                     bin_target_col,
                                     bin_method,
@@ -709,35 +780,25 @@ def clean_prep():
                                     labels
                                 )
 
-                                if not new_binned_col:
-                                    temp_col_name = "Preview_Bin" 
-                                else:
-                                    temp_col_name = new_binned_col
-                                
                                 st.write("### Bin Preview")
-                                
-                                new_df[temp_col_name] = preview_series
 
                                 preview_df = pd.DataFrame({
                                     bin_target_col: st.session_state["data"][bin_target_col],
-                                    "Bin": preview_series
+                                    "Bin": preview_series.astype(str)
                                 })
                                 st.dataframe(preview_df.head(10))
                                 st.write("### Bin Distribution")
-                                st.bar_chart(preview_series_str)
-                            
+                                st.bar_chart(distribution)
+
                             except Exception as e:
                                 st.error(f"Preview error: {e}")
-                            
+
                 else:
                     st.info("No numeric columns found in the dataset to bin.")
 
-
-
     st.space("xlarge")
 
-
-    # ------------------------ 4.3 DATA TYPES AND PARSING ------------------------
+    # ------------------------ 4 DATA TYPES AND PARSING ------------------------
 
     with st.container(border=True):
         st.subheader("4 Data Types and Parsing", text_alignment="center")
@@ -762,50 +823,34 @@ def clean_prep():
                         )
                 with st.container(horizontal_alignment="right"):
                     if st.button("Convert Column Type", key="convert_column_type", type="primary"):
-                        save_state()
 
                         new_df = st.session_state["data"].copy()
-                        
+
                         try:
-                            #convert to numeric
+                            # Convert to numeric
                             if new_type == "Numeric":
-                                # convert to string
-                                series = new_df[column_to_convert].astype(str)
+                                new_df[column_to_convert] = _clean_to_numeric(new_df[column_to_convert])
 
-                                # handle negative numbers in parentheses: "(123)" -> "-123"
-                                series = series.str.replace(r'^\((.*)\)$', r'-\1', regex=True)
-
-                                # remove everything except digits, decimal point, minus sign
-                                series = series.str.replace(r'[^0-9\.-]', '', regex=True)
-
-                                # remove multiple dots or trailing dots
-                                series = series.str.replace(r'\.(?=.*\.)', '', regex=True)
-                                series = series.str.rstrip('.')
-
-                                # convert to numeric, invalid parsing becomes NaN
-                                new_df[column_to_convert] = pd.to_numeric(series, errors='coerce')
-
-                            #convert to categorical
+                            # Convert to categorical
                             elif new_type == "Categorical":
-                                new_df[column_to_convert] = (
-                                    new_df[column_to_convert].astype("category")
-                                )
+                                new_df[column_to_convert] = new_df[column_to_convert].astype("category")
 
-                            #convert to datetime
+                            # Convert to datetime
                             elif new_type == "Datetime":
                                 new_df[column_to_convert] = pd.to_datetime(
                                     new_df[column_to_convert],
                                     errors="coerce"
                                 )
 
-                            #convert to string
+                            # Convert to string
                             elif new_type == "String":
-                                new_df[column_to_convert] = (
-                                    new_df[column_to_convert].astype("string")
-                                )
-                            # convert to boolean
+                                new_df[column_to_convert] = new_df[column_to_convert].astype("string")
+
+                            # Convert to boolean
                             elif new_type == "Boolean":
                                 series = new_df[column_to_convert].astype(str).str.lower().str.strip()
+                                # Treat "1.0"/"0.0" the same as "1"/"0"
+                                series = series.str.replace(r"\.0$", "", regex=True)
 
                                 mapping = {
                                     'true': True, '1': True, 'yes': True, 'y': True,
@@ -813,28 +858,27 @@ def clean_prep():
                                 }
                                 bool_series = series.map(mapping)
 
-                                unmapped_count = bool_series.isna().sum()
-                                if unmapped_count > 0:
-                                    st.warning(f"{unmapped_count} values could not be converted and are set as NaN")
+                                unmapped = int((bool_series.isna() & new_df[column_to_convert].notna()).sum())
+                                if unmapped > 0:
+                                    st.warning(f"{unmapped} values could not be converted and are set as NaN")
 
                                 new_df[column_to_convert] = bool_series
 
+                            save_state()
+                            st.session_state["data"] = new_df
+                            log_step(
+                                "Convert column type",
+                                {"Convert to": new_type},
+                                [column_to_convert]
+                            )
                             st.success(f"Column converted to {new_type} successfully")
 
                         except Exception as e:
                             st.error("Conversion failed")
-                            st.write(e) 
-                        
-                        st.session_state["data"] = new_df
-
-                        log_step(
-                            "Convert column type",
-                            {"Convert to: ": new_type},
-                            [column_to_convert]
-                        )
+                            st.write(e)
 
             st.space("large")
-            
+
             with st.container():
 
                 # Datetime parsing
@@ -842,14 +886,12 @@ def clean_prep():
 
                 with st.container(horizontal=True):
                     with st.container():
-                        # Separate column selector for datetime
                         datetime_column = st.selectbox(
                             "Select column to parse as Datetime",
                             st.session_state["data"].columns,
                             key="datetime_column"
                         )
                     with st.container():
-                        # Format selection
                         date_format_choice = st.radio(
                             "Select parsing method",
                             ["Auto-detect", "Manual Format"],
@@ -867,61 +909,51 @@ def clean_prep():
 
                 with st.container(horizontal_alignment="right"):
                     if st.button("Parse to Datetime", key="parse_datetime_btn", type="primary"):
-                        save_state()
 
                         new_df = st.session_state["data"].copy()
-                        
+
                         try:
                             if date_format_choice == "Auto-detect":
-                                new_df[datetime_column] = pd.to_datetime(
-                                    new_df[datetime_column], 
-                                    errors="coerce"
-                                )
+                                parsed = pd.to_datetime(new_df[datetime_column], errors="coerce")
                             else:
-                                new_df[datetime_column] = pd.to_datetime(
-                                    new_df[datetime_column], 
-                                    format=manual_format, 
-                                    errors="coerce"
-                                )
-                            
-                            # Check if parsing failed completely
-                            if new_df[datetime_column].isna().all():
+                                parsed = pd.to_datetime(new_df[datetime_column], format=manual_format, errors="coerce")
+
+                            # Only commit if parsing actually produced dates.
+                            if parsed.isna().all():
                                 st.warning("All values became NaT (Not a Time). Check if your chosen format matches the data.")
                             else:
+                                save_state()
+                                new_df[datetime_column] = parsed
                                 st.session_state["data"] = new_df
+                                log_step(
+                                    "Parse to datetime",
+                                    {"Parsing method": date_format_choice},
+                                    [datetime_column]
+                                )
                                 st.success(f"Successfully parsed '{datetime_column}' as Datetime.")
-                                
+
                         except Exception as e:
                             st.error(f"Error during parsing: {e}")
 
-                        log_step(
-                            "Parse to datetime",
-                            {"Parsing method": date_format_choice},
-                            [datetime_column]
-                        )
-
-        
-        # Show datatypes
+        # Show datatypes (from current data, so always up to date)
         datatypes = pd.DataFrame({
-            "Column": st.session_state["data"].columns,
-            "Data type": st.session_state["data"].dtypes[st.session_state["data"].columns].astype(str)
+            "Column": st.session_state["data"].columns.astype(str),
+            "Data type": st.session_state["data"].dtypes.astype(str).values
         })
         st.subheader("Data types:")
-        st.dataframe(datatypes, use_container_width=True, hide_index=True, width="content")
-
+        st.dataframe(datatypes, hide_index=True, width="content")
 
     st.space("medium")
 
-
     with st.container(horizontal=True):
 
-    # -------------------------------------- 4.4 CATEGORICAL DATA TOOLS ----------------------------
+        # -------------------------------------- 5 CATEGORICAL DATA TOOLS ----------------------------
 
         with st.container(border=True):
             st.subheader("5 Categorical Data Tools")
             st.space("medium")
 
-            cat_cols = st.session_state["data"].select_dtypes(include=["object", "category"]).columns
+            cat_cols = st.session_state["data"].select_dtypes(include=["object", "category", "string"]).columns
 
             if len(cat_cols) > 0:
 
@@ -943,26 +975,26 @@ def clean_prep():
 
                     new_df = st.session_state["data"].copy()
 
-                    if clean_option == "Trim whitespace":
-                        new_df[cat_col] = (
-                            new_df[cat_col].astype(str).str.strip()
-                        )
-                    elif clean_option == "Lowercase":
-                        new_df[cat_col] = (
-                            new_df[cat_col].astype(str).str.lower()
-                        )
-                    elif clean_option == "Title Case":
-                        new_df[cat_col] = (
-                            new_df[cat_col].astype(str).str.title()
-                        )
+                    # Work on non-null values only, so missing stays missing
+                    # (astype(str) on the whole column would turn NaN into "nan").
+                    source = new_df[cat_col]
+                    if isinstance(source.dtype, pd.CategoricalDtype):
+                        source = source.astype(object)
+                        new_df[cat_col] = source
+                    mask = source.notna()
+                    cleaned = source[mask].astype(str)
 
+                    if clean_option == "Trim whitespace":
+                        cleaned = cleaned.str.strip()
+                    elif clean_option == "Lowercase":
+                        cleaned = cleaned.str.lower()
+                    elif clean_option == "Title Case":
+                        cleaned = cleaned.str.title()
+
+                    new_df.loc[mask, cat_col] = cleaned
                     st.session_state["data"] = new_df
 
-                    log_step(
-                        "Standartization",
-                        {"Option": clean_option},
-                        [cat_col]
-                    )
+                    log_step("Standardization", {"Option": clean_option}, [cat_col])
                     st.success("Categorical values standardized")
 
                 st.divider()
@@ -973,8 +1005,12 @@ def clean_prep():
                 fill_other_option = st.checkbox("Set unmatched values to 'Other'", value=False, key="set_unmatched_other")
 
                 if 'mapping_data' not in st.session_state:
-                    # initialize mapping table
-                    st.session_state['mapping_data'] = pd.DataFrame({"Original Value": [], "Mapped Value": []})
+                    # Initialize the mapping table as text columns so the editor
+                    # accepts text entries.
+                    st.session_state['mapping_data'] = pd.DataFrame(
+                        {"Original Value": pd.Series([], dtype="string"),
+                         "Mapped Value": pd.Series([], dtype="string")}
+                    )
 
                 mapping_df = st.data_editor(
                     st.session_state['mapping_data'],
@@ -986,23 +1022,32 @@ def clean_prep():
                     save_state()
                     new_df = st.session_state["data"].copy()
 
-                    mapping_dict = mapping_df.dropna(subset=["Original Value"]).set_index("Original Value")["Mapped Value"].to_dict()
+                    mapping_dict = (
+                        mapping_df.dropna(subset=["Original Value"])
+                        .astype({"Original Value": "string"})
+                        .set_index("Original Value")["Mapped Value"]
+                        .to_dict()
+                    )
 
-                    # Apply mapping
-                    series = new_df[cat_col].astype(str)
-                    mapped_series = series.map(mapping_dict)
+                    original = new_df[cat_col]
+                    # Compare keys as text, but keep NaN as NaN throughout.
+                    keys = original.where(original.notna()).astype("string")
+                    mapped = keys.map(mapping_dict)
 
                     if fill_other_option:
-                        mapped_series = mapped_series.fillna("Other")
+                        # Unmatched but non-null values become "Other"; nulls stay null.
+                        mapped = mapped.mask(original.notna() & mapped.isna(), "Other")
                     else:
-                        mapped_series = mapped_series.fillna(series)
+                        # Unmatched values keep their original value.
+                        mapped = mapped.where(mapped.notna(), original)
 
-                    changed_count = (series != mapped_series).sum()
+                    changed_count = int(
+                        (original.fillna("\x00").astype(str) != mapped.fillna("\x00").astype(str)).sum()
+                    )
                     st.info(f"{changed_count} values were changed by the mapping.")
 
-                    new_df[cat_col] = mapped_series
+                    new_df[cat_col] = mapped
                     st.session_state["data"] = new_df
-
                     st.session_state['mapping_data'] = mapping_df
 
                     log_step(
@@ -1012,16 +1057,13 @@ def clean_prep():
                     )
                     st.success("Mapping applied successfully")
 
-                # st.space("xsmall")
                 st.divider()
 
                 st.markdown("Rare Category Grouping")
 
-                threshold = st.slider(
+                rare_threshold = st.slider(
                     "Minimum frequency (%)",
-                    0,
-                    20,
-                    5
+                    0, 20, 5
                 )
 
                 if st.button("Group Rare Categories", key="group_rare_btn"):
@@ -1030,29 +1072,26 @@ def clean_prep():
 
                     new_df = st.session_state["data"].copy()
 
-                    freq = new_df[cat_col].value_counts(normalize=True)
-                    rare = freq[freq < threshold / 100].index
+                    # Work on an object copy so adding the new "Other" label never
+                    # fails on a fixed categorical dtype.
+                    series = new_df[cat_col].astype(object)
+                    freq = series.value_counts(normalize=True)
+                    rare = freq[freq < rare_threshold / 100].index
 
-                    new_df[cat_col] = (
-                        new_df[cat_col].replace(rare, "Other")
-                    )
-                    
+                    series = series.where(~series.isin(rare), "Other")
+                    new_df[cat_col] = series
+
                     st.session_state["data"] = new_df
 
-                    log_step(
-                        "Grouping rare categories",
-                        {"Frequency": threshold},
-                        [cat_col]
-                    )
+                    log_step("Grouping rare categories", {"Frequency": rare_threshold}, [cat_col])
                     st.success("Rare categories grouped into 'Other'")
 
-
+            else:
+                st.info("No categorical columns found in the dataset.")
 
         st.space("medium")
 
-
-
-        # --------------------------------------- 4.5 NUMERIC CLEANING ------------------------------
+        # --------------------------------------- 6 NUMERIC CLEANING ------------------------------
 
         with st.container(border=True):
             st.subheader("6 Numeric Cleaning")
@@ -1073,228 +1112,174 @@ def clean_prep():
 
                 if st.button("Run Outlier Detection", type="primary"):
 
-                    save_state()
+                    col_data = st.session_state["data"][outlier_col]
 
-                    #IQR cal.
-                    Q1 = st.session_state["data"][outlier_col].quantile(0.25)
-                    Q3 = st.session_state["data"][outlier_col].quantile(0.75)
-
+                    # IQR calculation
+                    Q1 = col_data.quantile(0.25)
+                    Q3 = col_data.quantile(0.75)
                     IQR = Q3 - Q1
-
                     lower = Q1 - 1.5 * IQR
                     upper = Q3 + 1.5 * IQR
 
-                    # detect outliers
-                    outliers = st.session_state["data"][(st.session_state["data"][outlier_col] < lower) | (st.session_state["data"][outlier_col] > upper)]
+                    # Detect outliers (missing values are never outliers)
+                    outlier_mask = (col_data < lower) | (col_data > upper)
+                    outliers = st.session_state["data"][outlier_mask.fillna(False)]
 
-                    #column stats
-                    col_mean = st.session_state["data"][outlier_col].mean()
-                    col_median = st.session_state["data"][outlier_col].median()
-                    col_min = st.session_state["data"][outlier_col].min()
-                    col_max = st.session_state["data"][outlier_col].max()
+                    # Column stats
+                    col_mean = col_data.mean()
+                    col_median = col_data.median()
+                    col_min = col_data.min()
+                    col_max = col_data.max()
 
                     st.divider()
-
                     st.markdown("### Column Statistics")
-
                     c1, c2, c3, c4 = st.columns(4)
-
                     with c1:
                         st.metric("Mean", round(col_mean, 2))
-
                     with c2:
                         st.metric("Median", round(col_median, 2))
-
                     with c3:
-                        st.metric("Min", col_min)
-
+                        st.metric("Min", round(col_min, 2))
                     with c4:
-                        st.metric("Max", col_max)
+                        st.metric("Max", round(col_max, 2))
 
-                    #outlier boundaries
+                    # Outlier boundaries
                     st.markdown("### Outlier Boundaries (IQR Method)")
-
                     b1, b2 = st.columns(2)
-
                     with b1:
                         st.metric("Lower Limit", round(lower, 2))
-
                     with b2:
                         st.metric("Upper Limit", round(upper, 2))
 
                     st.divider()
 
-                    #outlier summary
+                    # Outlier summary
                     st.markdown("### Outlier Detection Summary")
-
                     total_rows = len(st.session_state["data"])
-                    outlier_count = len(outliers)
-                    percent = (outlier_count / total_rows) * 100
+                    outlier_count = int(outlier_mask.fillna(False).sum())
+                    percent = (outlier_count / total_rows) * 100 if total_rows else 0.0
 
                     s1, s2, s3 = st.columns(3)
-
                     with s1:
                         st.metric("Total Rows", total_rows)
-
                     with s2:
                         st.metric("Outliers Found", outlier_count)
-
                     with s3:
-                        st.metric("Percentage", f"{round(percent,2)}%")
+                        st.metric("Percentage", f"{round(percent, 2)}%")
 
-                    #action
+                    # Action
                     if action == "Show Outliers":
-
+                        # Read-only: no history snapshot, no log entry.
                         st.markdown("### Detected Outliers")
                         st.dataframe(outliers)
 
-                        st.session_state["transform_log"].append({
-                            "operation": "Detect Outliers",
-                            "parameters": {"method": "IQR", "count": outlier_count},
-                            "columns": [outlier_col]
-                        })
-
                     elif action == "Remove Outliers":
-
+                        save_state()
                         before = len(st.session_state["data"])
 
-                        st.session_state["data"] = st.session_state["data"][
-                            (st.session_state["data"][outlier_col] >= lower) &
-                            (st.session_state["data"][outlier_col] <= upper)
-                        ]
+                        # Keep rows inside the bounds and keep missing values.
+                        keep_mask = ~((col_data < lower) | (col_data > upper))
+                        st.session_state["data"] = st.session_state["data"][keep_mask].reset_index(drop=True)
 
-                        after = len(st.session_state["data"])
-                        removed = before - after
-
+                        removed = before - len(st.session_state["data"])
                         st.success(f"{removed} rows removed")
 
-                        st.session_state["transform_log"].append({
-                            "operation": "Remove Outliers",
-                            "parameters": {"method": "IQR", "rows_removed": removed},
-                            "columns": [outlier_col]
-                        })
+                        log_step(
+                            "Remove Outliers",
+                            {"method": "IQR", "rows_removed": removed},
+                            [outlier_col]
+                        )
 
                     elif action == "Cap Outliers":
+                        save_state()
+                        cap_count = outlier_count
 
-                        cap_count = len(outliers)
-
-                        st.session_state["data"][outlier_col] = st.session_state["data"][outlier_col].clip(lower, upper)
+                        new_df = st.session_state["data"].copy()
+                        new_df[outlier_col] = new_df[outlier_col].clip(lower, upper)
+                        st.session_state["data"] = new_df
 
                         st.success(f"{cap_count} values capped")
 
-                        st.session_state["transform_log"].append({
-                            "operation": "Cap Outliers",
-                            "parameters": {"method": "IQR", "values_capped": cap_count},
-                            "columns": [outlier_col]
-                        })
-
-                    log_step(
-                        "NUmeric cleaning",
-                        {"Action": action},
-                        [outlier_col]
-                    )
-
-
+                        log_step(
+                            "Cap Outliers",
+                            {"method": "IQR", "values_capped": cap_count},
+                            [outlier_col]
+                        )
+            else:
+                st.info("No numeric columns found in the dataset.")
 
         st.space("medium")
 
-
-
-        # ------------------------------ 4.6 NORMALIZATION AND SCALING --------------------
+        # ------------------------------ 7 NORMALIZATION AND SCALING --------------------
 
         with st.container(border=True):
             st.subheader("7 Normalization / Scaling")
 
             st.space("medium")
 
-            #get numeric columns
             numeric_cols = st.session_state["data"].select_dtypes(include=["number"]).columns.tolist()
 
             if not numeric_cols:
                 st.warning("No numeric columns available for scaling.")
             else:
-                #column selection for scaling
                 scale_columns = st.multiselect(
                     "Select numeric columns to scale",
-                numeric_cols
-            )
-
-            #choose scaling method
-            scaling_method = st.radio(
-                "Choose scaling method",
-                ["Min-Max Scaling", "Z-Score Standardization"]
-            )
-
-            if st.button("Apply Scaling", type="primary"):
-
-                save_state()
-
-                if not scale_columns:
-                    st.warning("Please select at least one column.")
-                else:
-
-                    #before stats
-                    before_stats = st.session_state["data"][scale_columns].describe()
-
-                    #min-max scaling
-                    if scaling_method == "Min-Max Scaling":
-                        for col in scale_columns:
-                            min_val = st.session_state["data"][col].min()
-                            max_val = st.session_state["data"][col].max()
-
-                            if max_val - min_val != 0:
-                                st.session_state["data"][col] = (
-                                    (st.session_state["data"][col] - min_val) / (max_val - min_val)
-                                )
-
-                    #Z-score standardizating
-                    elif scaling_method == "Z-Score Standardization":
-                        for col in scale_columns:
-                            mean_val = st.session_state["data"][col].mean()
-                            std_val = st.session_state["data"][col].std()
-
-                            if std_val != 0:
-                                st.session_state["data"][col] = (
-                                    (st.session_state["data"][col] - mean_val) / std_val
-                                )
-
-                    #after stats
-                    after_stats = st.session_state["data"][scale_columns].describe()
-
-                    st.success("Scaling applied successfully")
-
-                    st.markdown("### Before Scaling Stats")
-                    st.dataframe(before_stats)
-
-                    st.markdown("### After Scaling Stats")
-                    st.dataframe(after_stats)
-
-                    #log the transformation
-                    st.session_state["transform_log"].append({
-                        "operation": "Scaling",
-                        "parameters": {"method": scaling_method},
-                        "columns": scale_columns
-                    })  
-
-                log_step(
-                    "Normalization",
-                    {"Method": scaling_method},
-                    [numeric_cols]
+                    numeric_cols
                 )
 
+                scaling_method = st.radio(
+                    "Choose scaling method",
+                    ["Min-Max Scaling", "Z-Score Standardization"]
+                )
+
+                if st.button("Apply Scaling", type="primary"):
+
+                    if not scale_columns:
+                        st.warning("Please select at least one column.")
+                    else:
+                        save_state()
+
+                        # Before stats
+                        before_stats = st.session_state["data"][scale_columns].describe()
+
+                        new_df = st.session_state["data"].copy()
+
+                        if scaling_method == "Min-Max Scaling":
+                            for col in scale_columns:
+                                min_val = new_df[col].min()
+                                max_val = new_df[col].max()
+                                if max_val - min_val != 0:
+                                    new_df[col] = (new_df[col] - min_val) / (max_val - min_val)
+
+                        elif scaling_method == "Z-Score Standardization":
+                            for col in scale_columns:
+                                mean_val = new_df[col].mean()
+                                std_val = new_df[col].std()
+                                if std_val != 0:
+                                    new_df[col] = (new_df[col] - mean_val) / std_val
+
+                        st.session_state["data"] = new_df
+
+                        # After stats
+                        after_stats = st.session_state["data"][scale_columns].describe()
+
+                        st.success("Scaling applied successfully")
+                        st.markdown("### Before Scaling Stats")
+                        st.dataframe(before_stats)
+                        st.markdown("### After Scaling Stats")
+                        st.dataframe(after_stats)
+
+                        log_step("Normalization", {"Method": scaling_method}, list(scale_columns))
 
     st.space("medium")
 
-
-    # ----------------------------------- 4.8 Data Validation Rules --------------------------
+    # ----------------------------------- 8 DATA VALIDATION RULES --------------------------
 
     with st.container(border=True):
 
         st.subheader("8 Data Validation Rules", text_alignment="center")
 
         st.space("medium")
-
-        # with st.expander("Define Validation Rules", expanded=True):
 
         col1, col2, col3 = st.columns(3)
 
@@ -1333,21 +1318,22 @@ def clean_prep():
             elif rule_type == "Non-Null Constraint":
                 rule_config = {"non_null": True}
 
-        # --- Apply rule ---
+        # --- Apply rule (read-only check: finds violations, does not change data) ---
         if st.button("Validate Data", type="primary"):
 
-            save_state()
-
-            violations = pd.DataFrame()
+            column_data = st.session_state["data"][selected_column]
 
             if rule_type == "Numeric Range":
-                mask = (st.session_state["data"][selected_column] < rule_config["min"]) | (st.session_state["data"][selected_column] > rule_config["max"])
+                numeric = pd.to_numeric(column_data, errors="coerce")
+                # Flag values outside the range (non-numeric values are ignored here).
+                mask = ((numeric < rule_config["min"]) | (numeric > rule_config["max"])).fillna(False)
 
             elif rule_type == "Allowed Categories":
-                mask = st.session_state["data"][selected_column].isin(rule_config["categories"])
+                # A violation is a value that is NOT in the allowed list (and is not missing).
+                mask = (~column_data.astype("string").isin(rule_config["categories"])) & column_data.notna()
 
             elif rule_type == "Non-Null Constraint":
-                mask = st.session_state["data"][selected_column].isna()
+                mask = column_data.isna()
 
             violations = st.session_state["data"][mask].copy()
 
@@ -1360,23 +1346,13 @@ def clean_prep():
             else:
                 st.session_state["violations"] = pd.DataFrame()
                 st.success("No violations found")
-            
-            log_step(
-                "Validation",
-                {"Rule type": rule_type},
-                [selected_column]
-            )
 
-        # Show Violations Table
+        # Show violations table
         if "violations" in st.session_state and not st.session_state["violations"].empty:
             st.subheader("Violations Table")
+            st.dataframe(st.session_state["violations"], width="stretch")
 
-            st.dataframe(st.session_state["violations"], use_container_width=True)
-
-    
     st.space("xxlarge")
-
-
 
     # --------------------------------------- Dataset preview -------------------
 
@@ -1395,13 +1371,12 @@ def clean_prep():
     else:
         st.dataframe(st.session_state["data"])
 
+    # ------------------------------ Sidebar Transformation log ----------
 
-
-    # ------------------------------ Sidebar Tranformation log ----------
     with st.sidebar:
         st.header("Transformation Log", help="Your activities will be reflected here")
         with st.container(border=True, height=300):
-            
+
             if st.session_state["transform_log"]:
                 for i, step in enumerate(st.session_state["transform_log"], 1):
                     with st.container(border=True):
@@ -1411,7 +1386,6 @@ def clean_prep():
             else:
                 st.info("No transformations yet.")
 
-            # st.divider()
         with st.container():
             col1, col2 = st.columns(2)
 

@@ -1,7 +1,27 @@
-import streamlit as st
-import pandas as pd
+import io
 import json
 from datetime import datetime
+
+import streamlit as st
+import pandas as pd
+
+
+@st.cache_data
+def _dataframe_to_csv(df):
+    return df.to_csv(index=False).encode("utf-8")
+
+
+@st.cache_data
+def _dataframe_to_excel(df):
+    """Build the Excel file in memory (not on the server's disk).
+
+    Cached on the dataframe, so repeated reruns do not rebuild it, and nothing
+    is written to a shared file on disk.
+    """
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False)
+    return buffer.getvalue()
 
 
 def export_report():
@@ -19,30 +39,31 @@ def export_report():
 
     st.subheader("1. Export Cleaned Dataset")
 
-    # CSV Export
-    csv = df.to_csv(index=False).encode("utf-8")
+    # CSV export
     st.download_button(
         label="Download CSV",
-        data=csv,
+        data=_dataframe_to_csv(df),
         file_name="cleaned_data.csv",
         mime="text/csv"
     )
 
-    # Excel Export (optional)
-    try:
-        excel_file = "cleaned_data.xlsx"
-        df.to_excel(excel_file, index=False)
+    # Excel export - built on demand so it does not run on every rerun
+    # (building a large workbook on each interaction made the whole app slow).
+    st.caption("Excel files take longer to build for large datasets.")
+    if st.button("Prepare Excel file"):
+        try:
+            st.session_state["_excel_bytes"] = _dataframe_to_excel(df)
+        except Exception as e:
+            st.session_state.pop("_excel_bytes", None)
+            st.error(f"Excel export not available: {e}")
 
-        with open(excel_file, "rb") as f:
-            st.download_button(
-                label="Download Excel",
-                data=f,
-                file_name=excel_file,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-    except Exception as e:
-        st.info("Excel export not available")
-
+    if "_excel_bytes" in st.session_state:
+        st.download_button(
+            label="Download Excel",
+            data=st.session_state["_excel_bytes"],
+            file_name="cleaned_data.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
     st.divider()
 
@@ -56,7 +77,9 @@ def export_report():
 
     st.json(report)
 
-    report_json = json.dumps(report, indent=4)
+    # default=str is a safety net so the download never crashes on an
+    # unexpected value type.
+    report_json = json.dumps(report, indent=4, default=str)
 
     st.download_button(
         label="Download Report (JSON)",
@@ -64,7 +87,6 @@ def export_report():
         file_name="transformation_report.json",
         mime="application/json"
     )
-
 
     st.divider()
 
@@ -75,7 +97,7 @@ def export_report():
         "steps": st.session_state["transform_log"]
     }
 
-    recipe_json = json.dumps(recipe, indent=4)
+    recipe_json = json.dumps(recipe, indent=4, default=str)
 
     st.download_button(
         label="Download Recipe (JSON)",
@@ -83,6 +105,5 @@ def export_report():
         file_name="pipeline_recipe.json",
         mime="application/json"
     )
-
 
     st.divider()
